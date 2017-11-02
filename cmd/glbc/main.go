@@ -44,11 +44,14 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 
-	"k8s.io/ingress-gce/backends"
-	"k8s.io/ingress-gce/controller"
-	"k8s.io/ingress-gce/loadbalancers"
-	"k8s.io/ingress-gce/storage"
-	"k8s.io/ingress-gce/utils"
+	"k8s.io/ingress-gce/pkg/backends"
+	"k8s.io/ingress-gce/pkg/context"
+	"k8s.io/ingress-gce/pkg/controller"
+	"k8s.io/ingress-gce/pkg/loadbalancers"
+	neg "k8s.io/ingress-gce/pkg/networkendpointgroup"
+	"k8s.io/ingress-gce/pkg/storage"
+	"k8s.io/ingress-gce/pkg/utils"
+
 	"k8s.io/kubernetes/pkg/cloudprovider"
 	"k8s.io/kubernetes/pkg/cloudprovider/providers/gce"
 )
@@ -73,7 +76,7 @@ const (
 	alphaNumericChar = "0"
 
 	// Current docker image version. Only used in debug logging.
-	imageVersion = "glbc:0.9.6"
+	imageVersion = "glbc:0.9.7"
 
 	// Key used to persist UIDs to configmaps.
 	uidConfigMapName = "ingress-uid"
@@ -249,10 +252,11 @@ func main() {
 		SvcPort:  intstr.FromInt(int(port)),
 	}
 
+	var namer *utils.Namer
 	var cloud *gce.GCECloud
 	if *inCluster || *useRealCloud {
 		// Create cluster manager
-		namer, err := newNamer(kubeClient, *clusterName, controller.DefaultFirewallName)
+		namer, err = newNamer(kubeClient, *clusterName, controller.DefaultFirewallName)
 		if err != nil {
 			glog.Fatalf("%v", err)
 		}
@@ -262,14 +266,14 @@ func main() {
 		// However if the cloud client suddenly fails, we should try to re-create it
 		// and continue.
 		if *configFilePath != "" {
-			glog.Infof("Reading config from path %v", configFilePath)
+			glog.Infof("Reading config from path %v", *configFilePath)
 			config, err := os.Open(*configFilePath)
 			if err != nil {
 				glog.Fatalf("%v", err)
 			}
 			defer config.Close()
 			cloud = getGCEClient(config)
-			glog.Infof("Successfully loaded cloudprovider using config %q", configFilePath)
+			glog.Infof("Successfully loaded cloudprovider using config %q", *configFilePath)
 		} else {
 			// While you might be tempted to refactor so we simply assing nil to the
 			// config and only invoke getGCEClient once, that will not do the right
@@ -286,11 +290,10 @@ func main() {
 		// Create fake cluster manager
 		clusterManager = controller.NewFakeClusterManager(*clusterName, controller.DefaultFirewallName).ClusterManager
 	}
-
-	ctx := controller.NewControllerContext(kubeClient, *watchNamespace, *resyncPeriod)
-
+	enableNEG := cloud.AlphaFeatureGate.Enabled(gce.AlphaFeatureNetworkEndpointGroup)
+	ctx := context.NewControllerContext(kubeClient, *watchNamespace, *resyncPeriod, enableNEG)
 	// Start loadbalancer controller
-	lbc, err := controller.NewLoadBalancerController(kubeClient, ctx, clusterManager)
+	lbc, err := controller.NewLoadBalancerController(kubeClient, ctx, clusterManager, enableNEG)
 	if err != nil {
 		glog.Fatalf("%v", err)
 	}
@@ -299,6 +302,13 @@ func main() {
 		glog.V(3).Infof("Cluster name %+v", clusterManager.ClusterNamer.GetClusterName())
 	}
 	clusterManager.Init(&controller.GCETranslator{LoadBalancerController: lbc})
+
+	// Start NEG controller
+	if enableNEG {
+		negController, _ := neg.NewController(kubeClient, cloud, ctx, lbc.Translator, namer, *resyncPeriod)
+		go negController.Run(ctx.StopCh)
+	}
+
 	go registerHandlers(lbc)
 	go handleSigterm(lbc, *deleteAllOnQuit)
 
